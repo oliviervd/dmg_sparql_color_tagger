@@ -7,6 +7,7 @@ import logging
 import os
 import socket
 import ssl
+import colorsys
 
 import cv2
 import numpy as np
