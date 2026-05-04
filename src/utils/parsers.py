@@ -282,14 +282,16 @@ _COLORS_DICT = {
 }
 
 _HEX_KEYS = list(_COLORS_DICT.keys())
+
 _r = np.asarray([int(h[0:2], 16) for h in _HEX_KEYS], np.uint8)
 _g = np.asarray([int(h[2:4], 16) for h in _HEX_KEYS], np.uint8)
 _b = np.asarray([int(h[4:6], 16) for h in _HEX_KEYS], np.uint8)
+
 _LAB_REFERENCE = color.rgb2lab(np.dstack((_r, _g, _b)))
 
 
 # ---------------------------------------------------------------------------
-# SUPABASE HELPERS
+# SUPABASE
 # ---------------------------------------------------------------------------
 
 def fetch_all_rows(select_fields: str) -> list:
@@ -320,39 +322,8 @@ def fetch_all_rows(select_fields: str) -> list:
     return all_rows
 
 
-def _requests_session_with_retries(total_retries: int = 3, backoff_factor: float = 0.5) -> requests.Session:
-    session = requests.Session()
-
-    retry = Retry(
-        total=total_retries,
-        connect=total_retries,
-        read=total_retries,
-        status=total_retries,
-        backoff_factor=backoff_factor,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET"],
-        raise_on_status=False,
-    )
-
-    adapter = HTTPAdapter(max_retries=retry)
-
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
-    session.headers.update({
-        "User-Agent": "dmg-color-tagger/1.0"
-    })
-
-    return session
-
-
-def _fetch_json_with_retries(url: str, session: requests.Session, timeout=(5, 10)):
-    resp = session.get(url, timeout=timeout)
-    resp.raise_for_status()
-    return resp.json()
-
-
 # ---------------------------------------------------------------------------
-# IIIF HELPERS
+# IIIF / IMAGE FETCHING
 # ---------------------------------------------------------------------------
 
 def iiif_downscale_url(uri: str, width: int = 300) -> str:
@@ -363,6 +334,7 @@ def iiif_downscale_url(uri: str, width: int = 300) -> str:
 
 
 def safe_url(url: str) -> str:
+    # Important: encode $ as %24 but keep IIIF punctuation intact
     return quote(url, safe=":/,?=&%!")
 
 
@@ -382,113 +354,18 @@ def read_image_from_url(url: str, timeout: int = 15) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# IIIF MEDIA FETCHING
-# ---------------------------------------------------------------------------
-
-def add_media(refresh: bool = True):
-    data_list = fetch_all_rows("iiif_manifest, objectNumber, iiif_image_uris")
-    logging.info(f"Total objects fetched: {len(data_list)}")
-
-    filtered = [d for d in data_list if not d.get("iiif_image_uris")] if refresh else data_list
-    logging.info(f"Objects to process: {len(filtered)}")
-
-    session = _requests_session_with_retries()
-
-    success_count = 0
-    failed = []
-    no_images = []
-    skipped = []
-
-    for obj in tqdm(filtered, desc="Fetching manifests", unit="obj"):
-        object_number = obj.get("objectNumber")
-        url = obj.get("iiif_manifest")
-
-        if not url:
-            skipped.append(object_number)
-            continue
-
-        image_list = []
-        license_list = []
-        attribution_list = []
-
-        try:
-            manifest = _fetch_json_with_retries(url, session=session)
-        except Exception as e:
-            failed.append({
-                "objectNumber": object_number,
-                "url": url,
-                "reason": str(e)
-            })
-            continue
-
-        extracted = False
-
-        # IIIF v2
-        for canvas in manifest.get("sequences", [{}])[0].get("canvases", []):
-            try:
-                image_list.append(canvas["images"][0]["resource"]["@id"])
-                license_list.append(canvas["images"][0].get("license"))
-                attribution_list.append(canvas["images"][0].get("attribution"))
-                extracted = True
-            except Exception:
-                continue
-
-        # IIIF v3 fallback
-        if not extracted:
-            for canvas in manifest.get("items", []):
-                try:
-                    body = canvas.get("items", [{}])[0].get("items", [{}])[0].get("body", {})
-                    image = body.get("id") or body.get("@id")
-
-                    if image:
-                        image_list.append(image)
-                        license_list.append(body.get("license"))
-                        attribution_list.append(canvas.get("requiredStatement"))
-                        extracted = True
-                except Exception:
-                    continue
-
-        if image_list:
-            (
-                supabase.table("dmg_objects_LDES")
-                .update({
-                    "iiif_manifest": url,
-                    "iiif_image_uris": image_list,
-                    "CC_Licenses": license_list,
-                    "attributions": attribution_list,
-                })
-                .eq("objectNumber", object_number)
-                .execute()
-            )
-
-            success_count += 1
-        else:
-            no_images.append({
-                "objectNumber": object_number,
-                "url": url
-            })
-
-    logging.info(
-        f"Done: success={success_count}, "
-        f"failed={len(failed)}, "
-        f"no_images={len(no_images)}, "
-        f"skipped={len(skipped)}"
-    )
-
-
-# ---------------------------------------------------------------------------
-# COLOR EXTRACTION
+# COLOR HELPERS
 # ---------------------------------------------------------------------------
 
 def rgb_to_hex(rgb_color) -> str:
     return "#" + "".join("{:02x}".format(int(val)) for val in rgb_color)
 
 
-def color_name(peaked_color: str) -> str:
+def color_name(hex_color: str) -> str:
     peaked_rgb = np.asarray([
-        int(peaked_color[1:3], 16),
-        int(peaked_color[3:5], 16),
-        int(peaked_color[5:7], 16)
+        int(hex_color[1:3], 16),
+        int(hex_color[3:5], 16),
+        int(hex_color[5:7], 16)
     ], np.uint8)
 
     peaked_lab = color.rgb2lab(
@@ -502,6 +379,55 @@ def color_name(peaked_color: str) -> str:
     ) ** 0.5
 
     return _COLORS_DICT[_HEX_KEYS[lab_dist.argmin()]]
+
+
+def hex_to_base_color(hex_color: str) -> str:
+    hex_color = hex_color.lstrip("#")
+
+    r = int(hex_color[0:2], 16) / 255
+    g = int(hex_color[2:4], 16) / 255
+    b = int(hex_color[4:6], 16) / 255
+
+    h, s, v = colorsys.rgb_to_hsv(r, g, b)
+    hue = h * 360
+
+    if v < 0.15:
+        return "black"
+
+    if s < 0.12 and v > 0.85:
+        return "white"
+
+    if s < 0.18:
+        return "grey"
+
+    if 20 <= hue < 50 and s < 0.50 and v < 0.75:
+        return "brown"
+
+    if 35 <= hue < 70 and s < 0.35 and v > 0.50:
+        return "beige"
+
+    if hue < 15 or hue >= 345:
+        return "red"
+
+    if 15 <= hue < 45:
+        return "orange"
+
+    if 45 <= hue < 70:
+        return "yellow"
+
+    if 70 <= hue < 170:
+        return "green"
+
+    if 170 <= hue < 255:
+        return "blue"
+
+    if 255 <= hue < 310:
+        return "purple"
+
+    if 310 <= hue < 345:
+        return "pink"
+
+    return "unknown"
 
 
 def remove_background_ml(image: np.ndarray) -> np.ndarray:
@@ -529,7 +455,7 @@ def remove_background_ml(image: np.ndarray) -> np.ndarray:
         return image.reshape(image.shape[0] * image.shape[1], 3)
 
 
-def fetch_colors(modified_image: np.ndarray):
+def extract_colors(modified_image: np.ndarray) -> list:
     n_clusters = min(10, len(modified_image))
 
     clf = KMeans(n_clusters=n_clusters, n_init=10)
@@ -539,28 +465,35 @@ def fetch_colors(modified_image: np.ndarray):
     counts = Counter(labels)
     total = sum(counts.values())
 
-    result = []
+    colors = []
 
     for cluster_index, count in counts.items():
-        hex_color = rgb_to_hex(centers[cluster_index])
-        name = color_name(hex_color)
+        hex_value = rgb_to_hex(centers[cluster_index])
+        css_name = color_name(hex_value)
+        base = hex_to_base_color(hex_value)
         percentage = count / total
 
-        result.append({
-            "hex": hex_color,
-            "name": name,
-            "percentage": percentage
+        colors.append({
+            "hex": hex_value,
+            "css": css_name,
+            "base": base,
+            "percentage": round(percentage, 4)
         })
 
-    result.sort(key=lambda item: item["percentage"], reverse=True)
+    colors.sort(key=lambda c: c["percentage"], reverse=True)
 
-    return result
+    return colors
 
+
+# ---------------------------------------------------------------------------
+# MAIN PROCESSING
+# ---------------------------------------------------------------------------
 
 def preprocess_and_insert(image_uris: list, object_number: str):
-    hex_list = []
-    color_name_list = []
-    color_percentages_list = []
+    all_image_colors = []
+    hex_values_legacy = []
+    color_names_legacy = []
+    base_colors_legacy = []
     failures = []
 
     for uri in image_uris:
@@ -572,28 +505,28 @@ def preprocess_and_insert(image_uris: list, object_number: str):
             img = read_image_from_url(small_uri, timeout=15)
             img_resized = cv2.resize(img, (300, 200), interpolation=cv2.INTER_AREA)
 
-            colors = fetch_colors(remove_background_ml(img_resized))
+            foreground_pixels = remove_background_ml(img_resized)
+            colors = extract_colors(foreground_pixels)
 
-            if colors:
-                hex_values = [c["hex"] for c in colors]
-                css_names = [c["name"] for c in colors]
-                percentages = [round(c["percentage"], 4) for c in colors]
-
-                hex_list.append(hex_values)
-                color_name_list.append(css_names)
-                color_percentages_list.append(percentages)
-
-                logging.info(f"🎨 Dominant colors for {object_number}:")
-                for c in colors[:10]:
-                    logging.info(
-                        f"   {c['hex']} → {c['name']} ({c['percentage']:.2%})"
-                    )
-
-                logging.info(f"✅ Processed {small_uri}: {len(colors)} colors")
-
-            else:
+            if not colors:
                 failures.append({"uri": small_uri, "reason": "NO_COLORS"})
                 logging.warning(f"No colors extracted from {small_uri}")
+                continue
+
+            all_image_colors.append(colors)
+
+            hex_values_legacy.append([c["hex"] for c in colors])
+            color_names_legacy.append([c["css"] for c in colors])
+            base_colors_legacy.append([c["base"] for c in colors])
+
+            logging.info(f"🎨 Dominant colors for {object_number}:")
+            for c in colors[:10]:
+                logging.info(
+                    f"   {c['hex']} → {c['css']} → {c['base']} "
+                    f"({c['percentage']:.2%})"
+                )
+
+            logging.info(f"✅ Processed {small_uri}: {len(colors)} colors")
 
         except (Timeout, ReadTimeout, ConnectTimeout) as e:
             failures.append({"uri": small_uri, "reason": "TIMEOUT"})
@@ -608,7 +541,6 @@ def preprocess_and_insert(image_uris: list, object_number: str):
         except RequestsHTTPError as e:
             status_code = e.response.status_code if e.response is not None else "UNKNOWN"
             reason = f"HTTP_{status_code}"
-
             failures.append({"uri": small_uri, "reason": reason})
             logging.error(f"HTTP error while processing image {small_uri}: {e}")
             continue
@@ -623,45 +555,25 @@ def preprocess_and_insert(image_uris: list, object_number: str):
             logging.error(f"SSL error while processing image {small_uri}: {e}")
             continue
 
-        except HTTPError as e:
-            reason = f"HTTP_{e.code}"
-
-            failures.append({"uri": small_uri, "reason": reason})
-            logging.error(f"HTTP error while processing image {small_uri}: {e}")
-            continue
-
-        except URLError as e:
-            reason = str(e.reason)
-
-            if "timed out" in reason.lower():
-                status = "TIMEOUT"
-            elif "certificate" in reason.lower() or "ssl" in reason.lower():
-                status = "SSL_ERROR"
-            else:
-                status = "URL_ERROR"
-
-            failures.append({"uri": small_uri, "reason": status})
-            logging.error(f"URL error while processing image {small_uri}: {e}")
-            continue
-
         except Exception as e:
             failures.append({"uri": small_uri, "reason": "PROCESSING_ERROR"})
             logging.error(f"Failed to process image {small_uri}: {e}")
             continue
 
-    if color_name_list:
-        update_payload = {
-            "HEX_values": hex_list,
-            "color_names": color_name_list,
-        }
+    if all_image_colors:
+        payload = {
+            # New clean structured field
+            "colors": all_image_colors,
 
-        # Only use this if your Supabase table has this column.
-        # Otherwise remove this line.
-        update_payload["color_percentages"] = color_percentages_list
+            # Legacy / compatibility fields
+            "HEX_values": hex_values_legacy,
+            "color_names": color_names_legacy,
+            "base_colors": base_colors_legacy,
+        }
 
         (
             supabase.table("dmg_objects_LDES")
-            .update(update_payload)
+            .update(payload)
             .eq("objectNumber", object_number)
             .execute()
         )
@@ -693,7 +605,9 @@ def preprocess_and_insert(image_uris: list, object_number: str):
 
 
 def fetch_objects_needing_colors(force_reprocess: bool = False) -> list:
-    all_rows = fetch_all_rows("objectNumber, iiif_image_uris, HEX_values, CC_Licenses")
+    all_rows = fetch_all_rows(
+        "objectNumber, iiif_image_uris, HEX_values, CC_Licenses"
+    )
 
     if force_reprocess:
         needs_colors = [
@@ -754,7 +668,10 @@ def parse_colors(object_list: list, force_reprocess: bool = False):
                 logging.info(f"Skipping {object_number}; color data already exists")
                 continue
 
-            preprocess_and_insert(row.get("iiif_image_uris", []), object_number)
+            preprocess_and_insert(
+                row.get("iiif_image_uris", []),
+                object_number
+            )
 
         except Exception as e:
             logging.error(f"Error processing {object_number}: {e}")
