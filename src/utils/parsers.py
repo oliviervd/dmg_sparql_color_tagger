@@ -34,6 +34,24 @@ URL: str = os.getenv("SUPABASE_URL")
 KEY: str = os.getenv("SUPABASE_KEY")
 supabase: Client = create_client(URL, KEY)
 
+# ---------------------------------------------------------------------------
+# LICENSE FILTERING
+# ---------------------------------------------------------------------------
+
+BLOCKED_LICENSES = [
+    "http://rightsstatements.org/vocab/InC/1.0/",
+    "http://rightsstatements.org/vocab/CNE/1.0/",
+    "http://rightsstatements.org/vocab/UND/1.0/",
+    "http://rightsstatements.org/vocab/InC-EDU/1.0/",
+    "http://rightsstatements.org/vocab/InC-OW-EU/1.0/",
+]
+
+def is_accessible_license(license_url: str) -> bool:
+    """Return True if the image license allows access."""
+    if not license_url:
+        return True  # no license info — attempt to use it
+    return not any(blocked in license_url for blocked in BLOCKED_LICENSES)
+
 
 # ---------------------------------------------------------------------------
 # COLOR LOOKUP TABLE
@@ -283,11 +301,9 @@ _COLORS_DICT = {
 }
 
 _HEX_KEYS = list(_COLORS_DICT.keys())
-
 _r = np.asarray([int(h[0:2], 16) for h in _HEX_KEYS], np.uint8)
 _g = np.asarray([int(h[2:4], 16) for h in _HEX_KEYS], np.uint8)
 _b = np.asarray([int(h[4:6], 16) for h in _HEX_KEYS], np.uint8)
-
 _LAB_REFERENCE = color.rgb2lab(np.dstack((_r, _g, _b)))
 
 
@@ -307,308 +323,19 @@ def fetch_all_rows(select_fields: str) -> list:
             .range(from_idx, from_idx + batch - 1)
             .execute()
         )
-
         data = json.loads(resp.model_dump_json()).get("data", [])
-
         if not data:
             break
-
         all_rows.extend(data)
-
         if len(data) < batch:
             break
-
         from_idx += batch
 
     return all_rows
 
 
-# ---------------------------------------------------------------------------
-# IIIF / IMAGE FETCHING
-# ---------------------------------------------------------------------------
-
-def iiif_downscale_url(uri: str, width: int = 300) -> str:
-    return uri.replace(
-        "/full/full/0/default.jpg",
-        f"/full/{width},/0/default.jpg"
-    )
-
-
-def safe_url(url: str) -> str:
-    # Important: encode $ as %24 but keep IIIF punctuation intact
-    return quote(url, safe=":/,?=&%!")
-
-
-def read_image_from_url(url: str, timeout: int = 15) -> np.ndarray:
-    encoded_url = safe_url(url)
-
-    resp = requests.get(
-        encoded_url,
-        timeout=timeout,
-        headers={"User-Agent": "Mozilla/5.0"}
-    )
-
-    resp.raise_for_status()
-
-    image = Image.open(BytesIO(resp.content)).convert("RGB")
-    return np.array(image)
-
-
-# ---------------------------------------------------------------------------
-# COLOR HELPERS
-# ---------------------------------------------------------------------------
-
-def rgb_to_hex(rgb_color) -> str:
-    return "#" + "".join("{:02x}".format(int(val)) for val in rgb_color)
-
-
-def color_name(hex_color: str) -> str:
-    peaked_rgb = np.asarray([
-        int(hex_color[1:3], 16),
-        int(hex_color[3:5], 16),
-        int(hex_color[5:7], 16)
-    ], np.uint8)
-
-    peaked_lab = color.rgb2lab(
-        np.dstack((peaked_rgb[0], peaked_rgb[1], peaked_rgb[2]))
-    )
-
-    lab_dist = (
-        (_LAB_REFERENCE[:, :, 0] - peaked_lab[:, :, 0]) ** 2 +
-        (_LAB_REFERENCE[:, :, 1] - peaked_lab[:, :, 1]) ** 2 +
-        (_LAB_REFERENCE[:, :, 2] - peaked_lab[:, :, 2]) ** 2
-    ) ** 0.5
-
-    return _COLORS_DICT[_HEX_KEYS[lab_dist.argmin()]]
-
-
-def hex_to_base_color(hex_color: str) -> str:
-    hex_color = hex_color.lstrip("#")
-
-    r = int(hex_color[0:2], 16) / 255
-    g = int(hex_color[2:4], 16) / 255
-    b = int(hex_color[4:6], 16) / 255
-
-    h, s, v = colorsys.rgb_to_hsv(r, g, b)
-    hue = h * 360
-
-    if v < 0.15:
-        return "black"
-
-    if s < 0.12 and v > 0.85:
-        return "white"
-
-    if s < 0.18:
-        return "grey"
-
-    if 20 <= hue < 50 and s < 0.50 and v < 0.75:
-        return "brown"
-
-    if 35 <= hue < 70 and s < 0.35 and v > 0.50:
-        return "beige"
-
-    if hue < 15 or hue >= 345:
-        return "red"
-
-    if 15 <= hue < 45:
-        return "orange"
-
-    if 45 <= hue < 70:
-        return "yellow"
-
-    if 70 <= hue < 170:
-        return "green"
-
-    if 170 <= hue < 255:
-        return "blue"
-
-    if 255 <= hue < 310:
-        return "purple"
-
-    if 310 <= hue < 345:
-        return "pink"
-
-    return "unknown"
-
-
-def remove_background_ml(image: np.ndarray) -> np.ndarray:
-    try:
-        pil_image = Image.fromarray(image)
-        output = remove(pil_image)
-        output_array = np.array(output)
-
-        alpha = output_array[:, :, 3]
-        foreground_pixels = output_array[:, :, :3][alpha > 10]
-
-        if len(foreground_pixels) < 100:
-            logging.warning("rembg returned too few foreground pixels; using full image")
-            return image.reshape(image.shape[0] * image.shape[1], 3)
-
-        logging.info(
-            f"rembg: {len(foreground_pixels)} foreground pixels "
-            f"from {image.shape[0] * image.shape[1]} total"
-        )
-
-        return foreground_pixels
-
-    except Exception as e:
-        logging.warning(f"rembg failed: {e}; using full image")
-        return image.reshape(image.shape[0] * image.shape[1], 3)
-
-
-def extract_colors(modified_image: np.ndarray) -> list:
-    n_clusters = min(10, len(modified_image))
-
-    clf = KMeans(n_clusters=n_clusters, n_init=10)
-    labels = clf.fit_predict(modified_image)
-    centers = clf.cluster_centers_
-
-    counts = Counter(labels)
-    total = sum(counts.values())
-
-    colors = []
-
-    for cluster_index, count in counts.items():
-        hex_value = rgb_to_hex(centers[cluster_index])
-        css_name = color_name(hex_value)
-        base = hex_to_base_color(hex_value)
-        percentage = count / total
-
-        colors.append({
-            "hex": hex_value,
-            "css": css_name,
-            "base": base,
-            "percentage": round(percentage, 4)
-        })
-
-    colors.sort(key=lambda c: c["percentage"], reverse=True)
-
-    return colors
-
-
-# ---------------------------------------------------------------------------
-# MAIN PROCESSING
-# ---------------------------------------------------------------------------
-
-def preprocess_and_insert(image_uris: list, object_number: str):
-    all_image_colors = []
-    hex_values_legacy = []
-    color_names_legacy = []
-    base_colors_legacy = []
-    failures = []
-
-    for uri in image_uris:
-        small_uri = iiif_downscale_url(uri, width=300)
-
-        try:
-            logging.info(f"Fetching downscaled IIIF image: {small_uri}")
-
-            img = read_image_from_url(small_uri, timeout=15)
-            img_resized = cv2.resize(img, (300, 200), interpolation=cv2.INTER_AREA)
-
-            foreground_pixels = remove_background_ml(img_resized)
-            colors = extract_colors(foreground_pixels)
-
-            if not colors:
-                failures.append({"uri": small_uri, "reason": "NO_COLORS"})
-                logging.warning(f"No colors extracted from {small_uri}")
-                continue
-
-            all_image_colors.append(colors)
-
-            hex_values_legacy.append([c["hex"] for c in colors])
-            color_names_legacy.append([c["css"] for c in colors])
-            base_colors_legacy.append([c["base"] for c in colors])
-
-            logging.info(f"🎨 Dominant colors for {object_number}:")
-            for c in colors[:10]:
-                logging.info(
-                    f"   {c['hex']} → {c['css']} → {c['base']} "
-                    f"({c['percentage']:.2%})"
-                )
-
-            logging.info(f"✅ Processed {small_uri}: {len(colors)} colors")
-
-        except (Timeout, ReadTimeout, ConnectTimeout) as e:
-            failures.append({"uri": small_uri, "reason": "TIMEOUT"})
-            logging.error(f"Timeout while processing image {small_uri}: {e}")
-            continue
-
-        except SSLError as e:
-            failures.append({"uri": small_uri, "reason": "SSL_ERROR"})
-            logging.error(f"SSL error while processing image {small_uri}: {e}")
-            continue
-
-        except RequestsHTTPError as e:
-            status_code = e.response.status_code if e.response is not None else "UNKNOWN"
-            reason = f"HTTP_{status_code}"
-            failures.append({"uri": small_uri, "reason": reason})
-            logging.error(f"HTTP error while processing image {small_uri}: {e}")
-            continue
-
-        except socket.timeout:
-            failures.append({"uri": small_uri, "reason": "TIMEOUT"})
-            logging.error(f"Socket timeout while processing image {small_uri}")
-            continue
-
-        except ssl.SSLError as e:
-            failures.append({"uri": small_uri, "reason": "SSL_ERROR"})
-            logging.error(f"SSL error while processing image {small_uri}: {e}")
-            continue
-
-        except Exception as e:
-            failures.append({"uri": small_uri, "reason": "PROCESSING_ERROR"})
-            logging.error(f"Failed to process image {small_uri}: {e}")
-            continue
-
-    if all_image_colors:
-        payload = {
-            # New clean structured field
-            "colors": all_image_colors,
-
-            # Legacy / compatibility fields
-            "HEX_values": hex_values_legacy,
-            "color_names": color_names_legacy,
-            "base_colors": base_colors_legacy,
-        }
-
-        (
-            supabase.table("dmg_objects_LDES")
-            .update(payload)
-            .eq("objectNumber", object_number)
-            .execute()
-        )
-
-        logging.info(f"✅ Updated colors for {object_number}")
-
-    else:
-        failure_reasons = list({f["reason"] for f in failures})
-
-        if "TIMEOUT" in failure_reasons:
-            status = "TIMEOUT"
-        elif "SSL_ERROR" in failure_reasons:
-            status = "SSL_ERROR"
-        elif "HTTP_403" in failure_reasons or "HTTP_401" in failure_reasons:
-            status = "PERMISSION DENIED"
-        elif "NO_COLORS" in failure_reasons:
-            status = "NO_COLORS"
-        else:
-            status = "FAILED"
-
-        logging.warning(f"No colors extracted for {object_number}; marking {status}")
-
-        (
-            supabase.table("dmg_objects_LDES")
-            .update({"CC_Licenses": status})
-            .eq("objectNumber", object_number)
-            .execute()
-        )
-
-
 def fetch_objects_needing_colors(force_reprocess: bool = False) -> list:
-    all_rows = fetch_all_rows(
-        "objectNumber, iiif_image_uris, HEX_values, CC_Licenses"
-    )
+    all_rows = fetch_all_rows("objectNumber, iiif_image_uris, HEX_values, CC_Licenses")
 
     if force_reprocess:
         needs_colors = [
@@ -616,8 +343,7 @@ def fetch_objects_needing_colors(force_reprocess: bool = False) -> list:
             for row in all_rows
             if row.get("iiif_image_uris")
         ]
-
-        logging.info(f"{len(needs_colors)} objects queued for reprocessing force mode")
+        logging.info(f"{len(needs_colors)} objects queued for reprocessing (force mode)")
         return needs_colors
 
     blocked_statuses = [
@@ -640,40 +366,429 @@ def fetch_objects_needing_colors(force_reprocess: bool = False) -> list:
     return needs_colors
 
 
-def parse_colors(object_list: list, force_reprocess: bool = False):
-    logging.info(
-        f"Starting color extraction for {len(object_list)} objects "
-        f"(force={force_reprocess})"
+def fetch_objects_missing_colors(force_reprocess: bool = False) -> list:
+    """Return object numbers that have images but no entry in the colors column yet."""
+    all_rows = fetch_all_rows("objectNumber, iiif_image_uris, colors, CC_Licenses")
+
+    blocked_statuses = [
+        "PERMISSION DENIED",
+        "NO_COLORS",
+        "TIMEOUT",
+        "SSL_ERROR",
+        "FAILED",
+    ]
+
+    if force_reprocess:
+        needs_colors = [
+            row["objectNumber"]
+            for row in all_rows
+            if row.get("iiif_image_uris")
+            and len(row.get("iiif_image_uris", [])) > 0
+        ]
+        logging.info(f"{len(needs_colors)} objects queued for reprocessing (force mode)")
+        return needs_colors
+
+    needs_colors = [
+        row["objectNumber"]
+        for row in all_rows
+        if row.get("iiif_image_uris")
+        and len(row.get("iiif_image_uris", [])) > 0
+        and not row.get("colors")
+        and row.get("CC_Licenses") not in blocked_statuses
+    ]
+
+    logging.info(f"{len(needs_colors)} objects have no colors column data yet")
+    return needs_colors
+
+
+# ---------------------------------------------------------------------------
+# IIIF / IMAGE FETCHING
+# ---------------------------------------------------------------------------
+
+def _requests_session_with_retries(total_retries: int = 3, backoff_factor: float = 0.5) -> requests.Session:
+    session = requests.Session()
+    retry = Retry(
+        total=total_retries,
+        connect=total_retries,
+        read=total_retries,
+        status=total_retries,
+        backoff_factor=backoff_factor,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+        raise_on_status=False,
     )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    session.headers.update({"User-Agent": "dmg-color-tagger/1.0 (+https://github.com/dmg)"})
+    return session
+
+
+def _fetch_json_with_retries(url: str, session: requests.Session, timeout=(5, 10)):
+    resp = session.get(url, timeout=timeout)
+    if resp.status_code != 200:
+        raise RuntimeError(f"HTTP {resp.status_code}")
+    return resp.json()
+
+
+def add_media(refresh: bool = True):
+    """Fetch IIIF image URIs, licenses and attributions — filtering out restricted images."""
+    data_list = fetch_all_rows("iiif_manifest, objectNumber, iiif_image_uris")
+    logging.info(f"Total objects fetched: {len(data_list)}")
+
+    filtered = [d for d in data_list if not d.get("iiif_image_uris")] if refresh else data_list
+    logging.info(f"Objects to process: {len(filtered)}")
+
+    session = _requests_session_with_retries()
+    success_count = 0
+    failed = []
+    no_images = []
+    skipped = []
+
+    for obj in tqdm(filtered, desc="Fetching manifests", unit="obj"):
+        on = obj.get("objectNumber")
+        url = obj.get("iiif_manifest")
+
+        if not url:
+            skipped.append(on)
+            continue
+
+        _imageList, _licenseList, _attributionList = [], [], []
+
+        try:
+            _json = _fetch_json_with_retries(url, session=session)
+        except Exception as e:
+            failed.append({"objectNumber": on, "url": url, "reason": str(e)})
+            continue
+
+        try:
+            extracted = False
+
+            # IIIF v2 — filter by license
+            for canvas in _json.get("sequences", [{}])[0].get("canvases", []):
+                try:
+                    image = canvas["images"][0]["resource"]["@id"]
+                    license_url = canvas["images"][0].get("license")
+                    attribution = canvas["images"][0].get("attribution")
+
+                    if not is_accessible_license(license_url):
+                        logging.info(f"Skipping restricted image: {image} (license: {license_url})")
+                        continue
+
+                    _imageList.append(image)
+                    _licenseList.append(license_url)
+                    _attributionList.append(attribution)
+                    extracted = True
+                except Exception:
+                    continue
+
+            # IIIF v3 fallback — filter by license
+            if not extracted:
+                for canvas in _json.get("items", []):
+                    try:
+                        body = canvas.get("items", [{}])[0].get("items", [{}])[0].get("body", {})
+                        image = body.get("id") or body.get("@id")
+                        license_url = body.get("license")
+
+                        if not image:
+                            continue
+
+                        if not is_accessible_license(license_url):
+                            logging.info(f"Skipping restricted image: {image} (license: {license_url})")
+                            continue
+
+                        _imageList.append(image)
+                        _licenseList.append(license_url)
+                        _attributionList.append(canvas.get("requiredStatement"))
+                        extracted = True
+                    except Exception:
+                        continue
+
+        except Exception as e:
+            no_images.append({"objectNumber": on, "url": url})
+            continue
+
+        if _imageList or _licenseList or _attributionList:
+            supabase.table("dmg_objects_LDES").update({
+                "iiif_manifest": url,
+                "iiif_image_uris": _imageList,
+                "CC_Licenses": _licenseList,
+                "attributions": _attributionList,
+            }).eq("objectNumber", on).execute()
+            success_count += 1
+        else:
+            no_images.append({"objectNumber": on, "url": url})
+
+    logging.info(f"Done: success={success_count}, failed={len(failed)}, no_images={len(no_images)}, skipped={len(skipped)}")
+
+
+def iiif_downscale_url(uri: str, width: int = 300) -> str:
+    return uri.replace(
+        "/full/full/0/default.jpg",
+        f"/full/{width},/0/default.jpg"
+    )
+
+
+def safe_url(url: str) -> str:
+    return quote(url, safe=":/,?=&%!")
+
+
+def read_image_from_url(url: str, timeout: int = 15) -> np.ndarray:
+    encoded_url = safe_url(url)
+    resp = requests.get(
+        encoded_url,
+        timeout=timeout,
+        headers={"User-Agent": "Mozilla/5.0"}
+    )
+    resp.raise_for_status()
+    image = Image.open(BytesIO(resp.content)).convert("RGB")
+    return np.array(image)
+
+
+# ---------------------------------------------------------------------------
+# COLOR HELPERS
+# ---------------------------------------------------------------------------
+
+def rgb_to_hex(rgb_color) -> str:
+    return "#" + "".join("{:02x}".format(int(val)) for val in rgb_color)
+
+
+def color_name(hex_color: str) -> str:
+    peaked_rgb = np.asarray([
+        int(hex_color[1:3], 16),
+        int(hex_color[3:5], 16),
+        int(hex_color[5:7], 16)
+    ], np.uint8)
+    peaked_lab = color.rgb2lab(np.dstack((peaked_rgb[0], peaked_rgb[1], peaked_rgb[2])))
+    lab_dist = (
+        (_LAB_REFERENCE[:, :, 0] - peaked_lab[:, :, 0]) ** 2 +
+        (_LAB_REFERENCE[:, :, 1] - peaked_lab[:, :, 1]) ** 2 +
+        (_LAB_REFERENCE[:, :, 2] - peaked_lab[:, :, 2]) ** 2
+    ) ** 0.5
+    return _COLORS_DICT[_HEX_KEYS[lab_dist.argmin()]]
+
+
+def hex_to_base_color(hex_color: str) -> str:
+    hex_color = hex_color.lstrip("#")
+    r = int(hex_color[0:2], 16) / 255
+    g = int(hex_color[2:4], 16) / 255
+    b = int(hex_color[4:6], 16) / 255
+    h, s, v = colorsys.rgb_to_hsv(r, g, b)
+    hue = h * 360
+
+    if v < 0.15:
+        return "black"
+    if s < 0.12 and v > 0.85:
+        return "white"
+    if s < 0.18:
+        return "grey"
+    if 20 <= hue < 50 and s < 0.50 and v < 0.75:
+        return "brown"
+    if 35 <= hue < 70 and s < 0.35 and v > 0.50:
+        return "beige"
+    if hue < 15 or hue >= 345:
+        return "red"
+    if 15 <= hue < 45:
+        return "orange"
+    if 45 <= hue < 70:
+        return "yellow"
+    if 70 <= hue < 170:
+        return "green"
+    if 170 <= hue < 255:
+        return "blue"
+    if 255 <= hue < 310:
+        return "purple"
+    if 310 <= hue < 345:
+        return "pink"
+    return "unknown"
+
+
+def remove_background_ml(image: np.ndarray) -> np.ndarray:
+    try:
+        pil_image = Image.fromarray(image)
+        output = remove(pil_image)
+        output_array = np.array(output)
+        alpha = output_array[:, :, 3]
+        foreground_pixels = output_array[:, :, :3][alpha > 10]
+        if len(foreground_pixels) < 100:
+            logging.warning("rembg returned too few foreground pixels; using full image")
+            return image.reshape(image.shape[0] * image.shape[1], 3)
+        logging.info(f"rembg: {len(foreground_pixels)} foreground pixels from {image.shape[0] * image.shape[1]} total")
+        return foreground_pixels
+    except Exception as e:
+        logging.warning(f"rembg failed: {e}; using full image")
+        return image.reshape(image.shape[0] * image.shape[1], 3)
+
+
+def extract_colors(modified_image: np.ndarray) -> list:
+    n_clusters = min(10, len(modified_image))
+    clf = KMeans(n_clusters=n_clusters, n_init=10)
+    labels = clf.fit_predict(modified_image)
+    centers = clf.cluster_centers_
+    counts = Counter(labels)
+    total = sum(counts.values())
+    colors = []
+    for cluster_index, count in counts.items():
+        hex_value = rgb_to_hex(centers[cluster_index])
+        css_name = color_name(hex_value)
+        base = hex_to_base_color(hex_value)
+        percentage = count / total
+        colors.append({
+            "hex": hex_value,
+            "css": css_name,
+            "base": base,
+            "percentage": round(percentage, 4)
+        })
+    colors.sort(key=lambda c: c["percentage"], reverse=True)
+    return colors
+
+
+# ---------------------------------------------------------------------------
+# MAIN PROCESSING
+# ---------------------------------------------------------------------------
+
+def preprocess_and_insert(image_uris: list, object_number: str):
+    all_image_colors = []
+    hex_values_legacy = []
+    color_names_legacy = []
+    base_colors_legacy = []
+    failures = []
+
+    # check accessibility via HEAD request before downloading
+    accessible_uris = []
+    for uri in image_uris:
+        small_uri = iiif_downscale_url(uri, width=300)
+        try:
+            resp = requests.head(
+                safe_url(small_uri),
+                timeout=5,
+                headers={"User-Agent": "Mozilla/5.0"},
+                allow_redirects=True
+            )
+            if resp.status_code == 200:
+                accessible_uris.append(uri)
+            else:
+                logging.info(f"Skipping inaccessible image {small_uri} — HTTP {resp.status_code}")
+                failures.append({"uri": small_uri, "reason": f"HTTP_{resp.status_code}"})
+        except Exception as e:
+            logging.warning(f"HEAD request failed for {small_uri}: {e}")
+            failures.append({"uri": small_uri, "reason": "HEAD_FAILED"})
+
+    if not accessible_uris:
+        logging.warning(f"No accessible images for {object_number}")
+        failure_reasons = list({f["reason"] for f in failures})
+        if any("403" in r or "401" in r for r in failure_reasons):
+            status = "PERMISSION DENIED"
+        elif any("TIMEOUT" in r for r in failure_reasons):
+            status = "TIMEOUT"
+        else:
+            status = "PERMISSION DENIED"
+        supabase.table("dmg_objects_LDES").update({
+            "CC_Licenses": status
+        }).eq("objectNumber", object_number).execute()
+        return
+
+    logging.info(f"{len(accessible_uris)}/{len(image_uris)} images accessible for {object_number}")
+
+    for uri in accessible_uris:
+        small_uri = iiif_downscale_url(uri, width=300)
+
+        try:
+            logging.info(f"Fetching downscaled IIIF image: {small_uri}")
+            img = read_image_from_url(small_uri, timeout=15)
+            img_resized = cv2.resize(img, (300, 200), interpolation=cv2.INTER_AREA)
+            foreground_pixels = remove_background_ml(img_resized)
+            colors = extract_colors(foreground_pixels)
+
+            if not colors:
+                failures.append({"uri": small_uri, "reason": "NO_COLORS"})
+                logging.warning(f"No colors extracted from {small_uri}")
+                continue
+
+            all_image_colors.append(colors)
+            hex_values_legacy.append([c["hex"] for c in colors])
+            color_names_legacy.append([c["css"] for c in colors])
+            base_colors_legacy.append([c["base"] for c in colors])
+
+            logging.info(f"🎨 Dominant colors for {object_number}:")
+            for c in colors[:10]:
+                logging.info(f"   {c['hex']} → {c['css']} → {c['base']} ({c['percentage']:.2%})")
+
+            logging.info(f"✅ Processed {small_uri}: {len(colors)} colors")
+
+        except (Timeout, ReadTimeout, ConnectTimeout) as e:
+            failures.append({"uri": small_uri, "reason": "TIMEOUT"})
+            logging.error(f"Timeout: {small_uri}: {e}")
+            continue
+        except SSLError as e:
+            failures.append({"uri": small_uri, "reason": "SSL_ERROR"})
+            logging.error(f"SSL error: {small_uri}: {e}")
+            continue
+        except RequestsHTTPError as e:
+            status_code = e.response.status_code if e.response is not None else "UNKNOWN"
+            failures.append({"uri": small_uri, "reason": f"HTTP_{status_code}"})
+            logging.error(f"HTTP error: {small_uri}: {e}")
+            continue
+        except socket.timeout:
+            failures.append({"uri": small_uri, "reason": "TIMEOUT"})
+            logging.error(f"Socket timeout: {small_uri}")
+            continue
+        except ssl.SSLError as e:
+            failures.append({"uri": small_uri, "reason": "SSL_ERROR"})
+            logging.error(f"SSL error: {small_uri}: {e}")
+            continue
+        except Exception as e:
+            failures.append({"uri": small_uri, "reason": "PROCESSING_ERROR"})
+            logging.error(f"Failed to process {small_uri}: {e}")
+            continue
+
+    if all_image_colors:
+        supabase.table("dmg_objects_LDES").update({
+            "colors": all_image_colors,
+            "HEX_values": hex_values_legacy,
+            "color_names": color_names_legacy,
+            "base_colors": base_colors_legacy,
+        }).eq("objectNumber", object_number).execute()
+        logging.info(f"✅ Updated colors for {object_number}")
+    else:
+        failure_reasons = list({f["reason"] for f in failures})
+        if "TIMEOUT" in failure_reasons:
+            status = "TIMEOUT"
+        elif "SSL_ERROR" in failure_reasons:
+            status = "SSL_ERROR"
+        elif "HTTP_403" in failure_reasons or "HTTP_401" in failure_reasons:
+            status = "PERMISSION DENIED"
+        elif "NO_COLORS" in failure_reasons:
+            status = "NO_COLORS"
+        else:
+            status = "FAILED"
+        logging.warning(f"No colors extracted for {object_number}; marking {status}")
+        supabase.table("dmg_objects_LDES").update({
+            "CC_Licenses": status
+        }).eq("objectNumber", object_number).execute()
+
+
+def parse_colors(object_list: list, force_reprocess: bool = False):
+    logging.info(f"Starting color extraction for {len(object_list)} objects (force={force_reprocess})")
 
     for idx, object_number in enumerate(object_list, start=1):
         logging.info(f"[{idx}/{len(object_list)}] Processing {object_number}")
-
         try:
             resp = (
                 supabase.table("dmg_objects_LDES")
-                .select("objectNumber, iiif_image_uris, HEX_values")
+                .select("objectNumber, iiif_image_uris, HEX_values, colors")
                 .eq("objectNumber", object_number)
                 .execute()
             )
-
             data = json.loads(resp.model_dump_json()).get("data", [])
-
             if not data:
                 logging.warning(f"No record found for {object_number}")
                 continue
-
             row = data[0]
-
-            if row.get("HEX_values") and not force_reprocess:
+            if row.get("colors") and not force_reprocess:
                 logging.info(f"Skipping {object_number}; color data already exists")
                 continue
-
-            preprocess_and_insert(
-                row.get("iiif_image_uris", []),
-                object_number
-            )
-
+            preprocess_and_insert(row.get("iiif_image_uris", []), object_number)
         except Exception as e:
             logging.error(f"Error processing {object_number}: {e}")
 

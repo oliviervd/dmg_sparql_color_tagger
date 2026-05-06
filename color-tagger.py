@@ -1,4 +1,4 @@
-from src.utils.parsers import parse_colors, fetch_objects_needing_colors, test_one_object
+from src.utils.parsers import parse_colors, fetch_objects_needing_colors, fetch_objects_missing_colors, test_one_object
 import logging
 import argparse
 import json
@@ -29,13 +29,22 @@ def clear_progress():
 def main(
     run_parse_colors: bool = False,
     force_reprocess: bool = False,
+    only_missing: bool = False,
     batch_size: Optional[int] = None,
     resume: bool = False
 ):
     try:
         if run_parse_colors:
             logging.info("Fetching objects that need color extraction...")
-            _objects = fetch_objects_needing_colors(force_reprocess=force_reprocess)
+
+            if only_missing:
+                # strict mode — only objects with no colors column value at all
+                logging.info("Mode: only-missing — fetching objects with null colors column")
+                _objects = fetch_objects_missing_colors()
+            else:
+                # default mode — objects missing HEX_values or blocked statuses
+                _objects = fetch_objects_needing_colors(force_reprocess=force_reprocess)
+
             logging.info(f"Total objects queued: {len(_objects)}")
 
             # resume from last processed object
@@ -55,7 +64,6 @@ def main(
 
             logging.info(f"Parsing colors for {len(_objects)} objects...")
 
-            # wrap parse_colors to save progress after each object
             for idx, object_number in enumerate(_objects, start=1):
                 logging.info(f"[{idx}/{len(_objects)}] Processing {object_number}")
                 try:
@@ -80,6 +88,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="DMG color tagger")
     parser.add_argument("--colors", action="store_true", help="Extract colors")
     parser.add_argument("--force", action="store_true", help="Reprocess all objects even if colors already exist")
+    parser.add_argument("--only-missing", action="store_true", help="Only process objects with no colors column value")
     parser.add_argument("--batch", type=int, default=None, help="Only process this many objects then stop")
     parser.add_argument("--resume", action="store_true", help="Resume from last processed object")
     parser.add_argument("--clear-progress", action="store_true", help="Clear saved progress and start fresh")
@@ -98,6 +107,7 @@ if __name__ == "__main__":
         main(
             run_parse_colors=run_colors,
             force_reprocess=args.force,
+            only_missing=args.only_missing,
             batch_size=args.batch,
-            resume=args.resume or args.force  # ← auto-resume when force is set
+            resume=args.resume or args.force or args.only_missing
         )
