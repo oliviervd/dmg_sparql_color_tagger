@@ -1,9 +1,17 @@
-from src.utils.parsers import parse_colors, fetch_objects_needing_colors, fetch_objects_missing_colors, test_one_object
+from src.utils.parsers import (
+    parse_colors,
+    fetch_objects_needing_colors,
+    fetch_objects_missing_colors,
+    test_one_object,
+    validate_iiif_images,
+    revalidate_transient_failures,
+)
 import logging
 import argparse
 import json
 import os
 from typing import Optional
+
 
 
 PROGRESS_FILE = "color_progress.json"
@@ -93,6 +101,23 @@ if __name__ == "__main__":
     parser.add_argument("--resume", action="store_true", help="Resume from last processed object")
     parser.add_argument("--clear-progress", action="store_true", help="Clear saved progress and start fresh")
     parser.add_argument("--test", type=str, default=None, help="Test a single object number")
+    parser.add_argument("--validate-images", action="store_true",
+                        help="HEAD-check every stored iiif_image_uri, drop 403/404/dead links, "
+                             "and write back the survivors with their licenses and attributions")
+    parser.add_argument("--validate-only", type=str, default=None,
+                        help="Validate iiif images for a single objectNumber (handy for spot-checks)")
+    parser.add_argument("--retry-transient", action="store_true",
+                        help="Re-check only objects whose previous validation failed transiently "
+                             "(TIMEOUT / SSL_ERROR / FAILED). Re-fetches the manifest to recover "
+                             "the original URI list, then HEAD-checks again. Does NOT retry "
+                             "PERMISSION DENIED rows.")
+    parser.add_argument("--retry-statuses", type=str, default=None,
+                        help="Comma-separated CC_Licenses status strings to retry. "
+                             "Default: TIMEOUT,SSL_ERROR,FAILED. Pass e.g. 'TIMEOUT' to retry only timeouts.")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="With --validate-images or --retry-transient: log what would be written but don't touch the DB")
+    parser.add_argument("--workers", type=int, default=8,
+                        help="With --validate-images or --retry-transient: parallel workers across objects (default 8)")
     args = parser.parse_args()
 
     if args.test:
@@ -100,6 +125,26 @@ if __name__ == "__main__":
 
     elif args.clear_progress:
         clear_progress()
+
+    elif args.retry_transient:
+        statuses = (
+            tuple(s.strip() for s in args.retry_statuses.split(",") if s.strip())
+            if args.retry_statuses
+            else ("TIMEOUT", "SSL_ERROR", "FAILED")
+        )
+        revalidate_transient_failures(
+            workers=args.workers,
+            dry_run=args.dry_run,
+            include_statuses=statuses,
+            only_object_number=args.validate_only,
+        )
+
+    elif args.validate_images or args.validate_only:
+        validate_iiif_images(
+            workers=args.workers,
+            dry_run=args.dry_run,
+            only_object_number=args.validate_only,
+        )
 
     else:
         run_colors = args.colors or (not args.colors)

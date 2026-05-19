@@ -522,6 +522,737 @@ def add_media(refresh: bool = True):
     logging.info(f"Done: success={success_count}, failed={len(failed)}, no_images={len(no_images)}, skipped={len(skipped)}")
 
 
+# ---------------------------------------------------------------------------
+# IIIF IMAGE ACCESSIBILITY VALIDATOR
+# ---------------------------------------------------------------------------
+#
+# Re-checks images already stored in `iiif_image_uris` and keeps only the URIs
+# that actually load (not 403/404/5xx). Writes the survivors back into
+# `iiif_image_uris` together with their matching CC_Licenses (rights) and
+# attributions — same column shape as add_media() so nothing downstream
+# changes. Use after `add_media()` if you want to prune dead/forbidden images
+# without re-fetching every manifest.
+#
+# HEAD first, with a tiny ranged-GET fallback for servers that don't speak
+# HEAD (some IIIF image servers return 405/501). Runs in parallel across
+# objects, and within each object across that object's images.
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
+from datetime import datetime
+
+
+# ---------------------------------------------------------------------------
+# Failure logging helper
+# ---------------------------------------------------------------------------
+# Lightweight JSONL writer used by both validate_iiif_images and
+# revalidate_transient_failures. One file per run, one line per failed object.
+#
+# The schema is intentionally tiny — just enough to debug or feed back into
+# the pipeline:
+#   { "objectNumber": "...", "iiif_manifest": "...|null",
+#     "reasons": ["forbidden", "timeout"],  // distinct, sorted
+#     "image_count": 3, "failed_count": 2,
+#     "run": "validate-images", "checked_at": "2026-05-19T14:34:33Z" }
+#
+# Use as a context manager. Thread-safe — workers can call .log() concurrently.
+
+class _FailureLog:
+    def __init__(self, path, run_label):
+        self.path = path
+        self.run_label = run_label
+        self._fh = None
+        self._lock = Lock()
+        self._count = 0
+
+    def __enter__(self):
+        if self.path is None:
+            return self  # disabled mode
+        os.makedirs(os.path.dirname(os.path.abspath(self.path)), exist_ok=True)
+        self._fh = open(self.path, "a", encoding="utf-8")
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self._fh is not None:
+            self._fh.close()
+            self._fh = None
+
+    def log(self, object_number, iiif_manifest, reasons,
+            image_count=None, failed_count=None):
+        if self._fh is None:
+            return
+        # De-duplicate and sort reasons so the line is stable regardless of
+        # which order workers finished in.
+        distinct_reasons = sorted({r for r in (reasons or []) if r})
+        record = {
+            "objectNumber": object_number,
+            "iiif_manifest": iiif_manifest,
+            "reasons": distinct_reasons,
+            "image_count": image_count,
+            "failed_count": failed_count,
+            "run": self.run_label,
+            "checked_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+        line = json.dumps(record, ensure_ascii=False) + "\n"
+        with self._lock:
+            self._fh.write(line)
+            self._fh.flush()
+            self._count += 1
+
+    @property
+    def count(self):
+        return self._count
+
+
+def _default_failure_log_path(run_label):
+    """Return ./logs/failures_<run>_<timestamp>.jsonl"""
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    return os.path.join("logs", f"failures_{run_label}_{ts}.jsonl")
+
+
+def _check_iiif_image_accessible(uri: str, session: requests.Session,
+                                 timeout: int = 10) -> tuple:
+    """
+    Return (ok: bool, http_status_or_None, reason: str).
+    'ok' means HTTP 2xx/3xx. 403/404/5xx and network errors → False.
+    """
+    encoded = safe_url(uri)
+    try:
+        r = session.head(encoded, timeout=timeout, allow_redirects=True,
+                         headers={"User-Agent": "Mozilla/5.0"})
+        code = r.status_code
+        if code in (405, 501):
+            # Server doesn't support HEAD — try a 1-byte GET.
+            r = session.get(encoded, timeout=timeout, stream=True,
+                            allow_redirects=True,
+                            headers={"User-Agent": "Mozilla/5.0",
+                                     "Range": "bytes=0-0"})
+            code = r.status_code
+            r.close()
+        if 200 <= code < 400:
+            return True, code, "ok"
+        if code == 403:
+            return False, code, "forbidden"
+        if code == 404:
+            return False, code, "not_found"
+        return False, code, f"http_{code}"
+    except (Timeout, ReadTimeout, ConnectTimeout):
+        return False, None, "timeout"
+    except SSLError:
+        return False, None, "ssl_error"
+    except Exception as e:
+        return False, None, f"error:{type(e).__name__}"
+
+
+def _validate_one_object(row: dict, session: requests.Session) -> dict:
+    """
+    Worker: HEAD-check every image of one object. Returns a result dict the
+    main thread can act on (DB write + counter bump).
+    """
+    object_number = row.get("objectNumber")
+    uris = row.get("iiif_image_uris") or []
+    licenses = row.get("CC_Licenses")
+    attributions = row.get("attributions") or []
+
+    # CC_Licenses can legitimately hold a status string from earlier failures
+    # ("PERMISSION DENIED", "TIMEOUT", ...). Treat that as "no per-image
+    # license info" — we keep validating, but we won't pair non-existent
+    # licenses with images.
+    if not isinstance(licenses, list):
+        licenses = []
+
+    if not uris:
+        return {"objectNumber": object_number, "outcome": "no_uris"}
+
+    # Align license/attribution lists with the URI list by index.
+    def _at(lst, i):
+        return lst[i] if i < len(lst) else None
+
+    statuses = [None] * len(uris)
+    with ThreadPoolExecutor(max_workers=min(4, len(uris))) as pool:
+        fut_to_idx = {
+            pool.submit(_check_iiif_image_accessible, uri, session): i
+            for i, uri in enumerate(uris)
+        }
+        for fut in as_completed(fut_to_idx):
+            i = fut_to_idx[fut]
+            try:
+                statuses[i] = fut.result()
+            except Exception as e:
+                statuses[i] = (False, None, f"crash:{e}")
+
+    kept_uris, kept_licenses, kept_attributions = [], [], []
+    per_image = []
+    for i, uri in enumerate(uris):
+        ok, code, reason = statuses[i]
+        per_image.append({
+            "uri": uri,
+            "ok": ok,
+            "code": code,
+            "reason": reason,
+            "license": _at(licenses, i),
+        })
+        if ok:
+            kept_uris.append(uri)
+            kept_licenses.append(_at(licenses, i))
+            kept_attributions.append(_at(attributions, i))
+
+    return {
+        "objectNumber": object_number,
+        "outcome": "checked",
+        "original_count": len(uris),
+        "kept_count": len(kept_uris),
+        "per_image": per_image,
+        "kept_uris": kept_uris,
+        "kept_licenses": kept_licenses,
+        "kept_attributions": kept_attributions,
+    }
+
+
+def validate_iiif_images(refresh: bool = False,
+                         workers: int = 8,
+                         dry_run: bool = False,
+                         only_object_number: str = None,
+                         failure_log_path: str = "__default__"):
+    """
+    Validate the URIs in `iiif_image_uris` for every object that has any.
+
+    Parameters
+    ----------
+    refresh : bool
+        If False (default), only re-check objects whose `iiif_image_uris` is
+        non-empty (i.e. you want to prune dead links). If True, same effect
+        right now — kept as a flag for symmetry with add_media().
+    workers : int
+        Parallel workers across objects (default 8). Each object also fans
+        out to up to 4 parallel HEADs internally.
+    dry_run : bool
+        Log what would be written, but don't touch Supabase.
+    only_object_number : str | None
+        Validate a single object by objectNumber. Useful for spot-checks.
+
+    What it writes
+    --------------
+    On every checked object:
+      - `iiif_image_uris`   ← list of URIs that returned 2xx/3xx
+      - `CC_Licenses`       ← per-image rights statements, aligned to the
+                              kept URIs (same shape as add_media() writes)
+      - `attributions`      ← per-image attributions, aligned to the kept URIs
+
+    If *all* images are inaccessible, `iiif_image_uris` is set to [] and
+    `CC_Licenses` is overwritten with the status string "PERMISSION DENIED"
+    (when 403s dominated) or "FAILED" otherwise — matching the convention
+    already used by preprocess_and_insert().
+    """
+    rows = fetch_all_rows("objectNumber, iiif_image_uris, CC_Licenses, attributions")
+    if only_object_number:
+        rows = [r for r in rows if r.get("objectNumber") == only_object_number]
+
+    candidates = [r for r in rows if r.get("iiif_image_uris")]
+    logging.info(f"validate_iiif_images: {len(candidates)} objects with images "
+                 f"(of {len(rows)} fetched){' [dry-run]' if dry_run else ''}")
+
+    counters = {
+        "processed": 0,
+        "all_ok": 0,
+        "partial_pruned": 0,
+        "all_failed": 0,
+        "updates": 0,
+        "no_change": 0,
+        "errors": 0,
+        "by_reason": {},          # e.g. {"ok": 1234, "forbidden": 56, "not_found": 7}
+        "by_http_code": {},       # e.g. {200: 1234, 403: 56, 404: 7}
+        "total_images": 0,
+        "working_images": 0,
+        "forbidden_images": 0,    # the headline number you asked for
+        "not_found_images": 0,
+        "license_seen": {},       # license URL → total images seen
+        "license_ok": {},         # license URL → images that loaded
+        "license_forbidden": {},  # license URL → images that 403'd
+    }
+    lock = Lock()
+    session = _requests_session_with_retries()
+
+    def _bump_reason(reason):
+        counters["by_reason"][reason] = counters["by_reason"].get(reason, 0) + 1
+
+    def _handle(result):
+        on = result["objectNumber"]
+        if result["outcome"] == "no_uris":
+            return
+
+        original = result["original_count"]
+        kept = result["kept_count"]
+        per_image = result["per_image"]
+
+        with lock:
+            for entry in per_image:
+                _bump_reason(entry["reason"])
+                # http code histogram (None for network errors)
+                code_key = entry["code"] if entry["code"] is not None else "no_response"
+                counters["by_http_code"][code_key] = counters["by_http_code"].get(code_key, 0) + 1
+                # totals
+                counters["total_images"] += 1
+                if entry["ok"]:
+                    counters["working_images"] += 1
+                if entry["reason"] == "forbidden":
+                    counters["forbidden_images"] += 1
+                elif entry["reason"] == "not_found":
+                    counters["not_found_images"] += 1
+                # license correlation — "<no license>" sentinel for None/missing
+                lic = entry.get("license") or "<no license>"
+                counters["license_seen"][lic] = counters["license_seen"].get(lic, 0) + 1
+                if entry["ok"]:
+                    counters["license_ok"][lic] = counters["license_ok"].get(lic, 0) + 1
+                if entry["reason"] == "forbidden":
+                    counters["license_forbidden"][lic] = counters["license_forbidden"].get(lic, 0) + 1
+            if kept == original:
+                counters["all_ok"] += 1
+            elif kept == 0:
+                counters["all_failed"] += 1
+            else:
+                counters["partial_pruned"] += 1
+
+        # Log a compact per-object summary.
+        if kept == original:
+            logging.info(f"[{on}] {kept}/{original} images OK")
+        else:
+            logging.info(f"[{on}] kept {kept}/{original} images")
+            for entry in per_image:
+                if not entry["ok"]:
+                    logging.info(f"   ✗ [{entry['reason']}"
+                                 f"{' '+str(entry['code']) if entry['code'] else ''}]"
+                                 f" {entry['uri']}")
+
+        try:
+            if kept == 0:
+                # Decide which status string to drop into CC_Licenses, matching
+                # the convention from preprocess_and_insert().
+                reasons = {e["reason"] for e in per_image}
+                if "forbidden" in reasons:
+                    status = "PERMISSION DENIED"
+                elif "timeout" in reasons:
+                    status = "TIMEOUT"
+                elif "ssl_error" in reasons:
+                    status = "SSL_ERROR"
+                else:
+                    status = "FAILED"
+                payload = {
+                    "iiif_image_uris": [],
+                    "CC_Licenses": status,
+                    "attributions": [],
+                }
+            else:
+                payload = {
+                    "iiif_image_uris": result["kept_uris"],
+                    "CC_Licenses": result["kept_licenses"],
+                    "attributions": result["kept_attributions"],
+                }
+
+            if dry_run:
+                logging.info(f"[{on}] [dry-run] would write: "
+                             f"{len(payload['iiif_image_uris']) if isinstance(payload['iiif_image_uris'], list) else 0} "
+                             f"uris, CC_Licenses={payload['CC_Licenses'] if isinstance(payload['CC_Licenses'], str) else 'list'}")
+                with lock:
+                    counters["updates"] += 1
+            else:
+                supabase.table("dmg_objects_LDES").update(payload).eq(
+                    "objectNumber", on
+                ).execute()
+                with lock:
+                    counters["updates"] += 1
+        except Exception as e:
+            logging.error(f"[{on}] DB update failed: {e}")
+            with lock:
+                counters["errors"] += 1
+        finally:
+            with lock:
+                counters["processed"] += 1
+
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        futures = [pool.submit(_validate_one_object, row, session) for row in candidates]
+        for fut in tqdm(as_completed(futures), total=len(futures),
+                        desc="Validating images", unit="obj"):
+            try:
+                _handle(fut.result())
+            except Exception as e:
+                logging.error(f"Worker crashed: {e}")
+                with lock:
+                    counters["errors"] += 1
+                    counters["processed"] += 1
+
+    # ----- final analysis ---------------------------------------------------
+    total_imgs = counters["total_images"]
+    working = counters["working_images"]
+    forbidden = counters["forbidden_images"]
+    not_found = counters["not_found_images"]
+    other_fail = total_imgs - working - forbidden - not_found
+
+    def _pct(n, d):
+        return f"{(100.0 * n / d):.1f}%" if d else "—"
+
+    logging.info("=" * 60)
+    logging.info("           validate_iiif_images — FINAL ANALYSIS")
+    logging.info("=" * 60)
+    logging.info(f"  Mode:                  {'DRY RUN' if dry_run else 'LIVE'}")
+    logging.info("")
+    logging.info("  --- Objects ---")
+    logging.info(f"  Objects processed:     {counters['processed']}")
+    logging.info(f"    fully OK:            {counters['all_ok']}")
+    logging.info(f"    partially pruned:    {counters['partial_pruned']}")
+    logging.info(f"    completely failed:   {counters['all_failed']}")
+    logging.info(f"  DB writes:             {counters['updates']}{' (dry-run)' if dry_run else ''}")
+    logging.info(f"  Worker errors:         {counters['errors']}")
+    logging.info("")
+    logging.info("  --- Images ---")
+    logging.info(f"  Total images checked:  {total_imgs}")
+    logging.info(f"    working (2xx/3xx):   {working}  ({_pct(working, total_imgs)})")
+    logging.info(f"    403 forbidden:       {forbidden}  ({_pct(forbidden, total_imgs)})")
+    logging.info(f"    404 not found:       {not_found}  ({_pct(not_found, total_imgs)})")
+    logging.info(f"    other failures:      {other_fail}  ({_pct(other_fail, total_imgs)})")
+    logging.info("")
+    logging.info("  --- HTTP status breakdown ---")
+    for code in sorted(counters["by_http_code"].keys(), key=lambda x: (isinstance(x, str), x)):
+        logging.info(f"    {code}: {counters['by_http_code'][code]}")
+    logging.info("")
+    logging.info("  --- Failure reasons ---")
+    for reason in sorted(counters["by_reason"].keys()):
+        logging.info(f"    {reason}: {counters['by_reason'][reason]}")
+    logging.info("")
+    logging.info("  --- Licenses (per image, across all checked images) ---")
+    if not counters["license_seen"]:
+        logging.info("    (no license data available)")
+    else:
+        # Sort by total images seen, most common first.
+        sorted_licenses = sorted(
+            counters["license_seen"].items(),
+            key=lambda kv: kv[1],
+            reverse=True,
+        )
+        # Compact rights-statement names for readability.
+        def _short_license(lic):
+            if not isinstance(lic, str):
+                return str(lic)
+            if "rightsstatements.org/vocab/" in lic:
+                # Pull out e.g. "InC/1.0" from the URL.
+                tail = lic.rstrip("/").split("rightsstatements.org/vocab/")[-1]
+                return f"RS:{tail}"
+            if "creativecommons.org/" in lic:
+                tail = lic.rstrip("/").split("creativecommons.org/")[-1]
+                return f"CC:{tail}"
+            return lic
+
+        logging.info(f"    {'license':<50} {'total':>7} {'ok':>7} {'403':>7}")
+        for lic, total in sorted_licenses:
+            ok_n = counters["license_ok"].get(lic, 0)
+            forb_n = counters["license_forbidden"].get(lic, 0)
+            label = _short_license(lic)
+            if len(label) > 50:
+                label = label[:47] + "..."
+            logging.info(f"    {label:<50} {total:>7} {ok_n:>7} {forb_n:>7}")
+    logging.info("=" * 60)
+
+
+def revalidate_transient_failures(workers: int = 8,
+                                  dry_run: bool = False,
+                                  include_statuses: tuple = ("TIMEOUT", "SSL_ERROR", "FAILED", "http_500"),
+                                  only_object_number: str = None):
+    """
+    Retry validation for objects whose images all failed *transiently* on a
+    previous run.
+
+    Why this exists
+    ---------------
+    `validate_iiif_images` writes a status string into `CC_Licenses` when every
+    image of an object failed validation:
+        - "PERMISSION DENIED"  → 403s (genuine, don't retry)
+        - "TIMEOUT"            → network timeouts (likely transient)
+        - "SSL_ERROR"          → TLS errors (often transient)
+        - "FAILED"             → other failures, e.g. HTTP 5xx (likely transient)
+    This function picks up only the transient ones and re-tries them. Per the
+    last full-run histogram, that's typically a few thousand rows out of tens
+    of thousands — much cheaper than re-running the full validator.
+
+    How it works
+    ------------
+    Because the failed run also emptied `iiif_image_uris`, the original URI
+    list is gone from the DB. We recover it by re-fetching the IIIF manifest
+    (same logic as add_media), repopulating the three columns, and then
+    HEAD-checking the URIs (same logic as validate_iiif_images). Anything that
+    still fails after this pass is written back with a fresh status — so a
+    second retry run is idempotent.
+
+    What it CAN'T fix
+    -----------------
+    Partial prunes from earlier runs. If an object had 3 images and 1 timed
+    out, the validator already dropped that URI and kept the other 2; the lost
+    URI isn't recoverable from the DB row alone. To re-check those, you'd
+    need to re-run add_media() with refresh=True, which re-fetches every
+    manifest. That's a different (much heavier) operation.
+
+    Parameters
+    ----------
+    workers : int
+        Parallel workers across objects (default 8).
+    dry_run : bool
+        Log what would happen without touching the DB.
+    include_statuses : tuple of str
+        Which `CC_Licenses` status strings to treat as retry candidates.
+        Default covers all transient categories. Pass e.g. ("TIMEOUT",) to
+        retry only timeouts.
+    only_object_number : str | None
+        Retry a single object by objectNumber. Useful for spot-checks.
+    """
+    # 1) Find the candidate rows. CC_Licenses is text-or-array, so we filter
+    #    in Python rather than in PostgREST.
+    rows = fetch_all_rows("objectNumber, iiif_manifest, CC_Licenses")
+    if only_object_number:
+        rows = [r for r in rows if r.get("objectNumber") == only_object_number]
+
+    def _status_of(row):
+        v = row.get("CC_Licenses")
+        return v if isinstance(v, str) else None
+
+    candidates = [
+        r for r in rows
+        if _status_of(r) in include_statuses
+        and r.get("iiif_manifest")
+    ]
+    logging.info(
+        f"revalidate_transient_failures: {len(candidates)} candidates "
+        f"(statuses={list(include_statuses)})"
+        f"{' [dry-run]' if dry_run else ''}"
+    )
+    if not candidates:
+        logging.info("Nothing to retry.")
+        return
+
+    # 2) Re-populate iiif_image_uris from the manifest, then HEAD-check.
+    counters = {
+        "processed": 0,
+        "recovered_full": 0,     # all images now load
+        "recovered_partial": 0,  # some images load
+        "still_failing": 0,      # none load
+        "manifest_failed": 0,
+        "updates": 0,
+        "errors": 0,
+        "by_reason": {},
+        "before_status": {},
+        "after_status": {},
+    }
+    lock = Lock()
+    manifest_session = _requests_session_with_retries()
+    head_session = _requests_session_with_retries()
+
+    def _bump(d, k):
+        d[k] = d.get(k, 0) + 1
+
+    def _retry_one(row):
+        on = row["objectNumber"]
+        manifest_url = row["iiif_manifest"]
+        before = _status_of(row) or "?"
+
+        # Re-fetch manifest and re-extract image entries — mirrors add_media().
+        try:
+            manifest = _fetch_json_with_retries(manifest_url, session=manifest_session)
+        except Exception as e:
+            return {
+                "objectNumber": on,
+                "outcome": "manifest_failed",
+                "before": before,
+                "reason": str(e),
+            }
+
+        uris, licenses, attributions = [], [], []
+        # IIIF v2
+        for canvas in manifest.get("sequences", [{}])[0].get("canvases", []):
+            try:
+                image = canvas["images"][0]["resource"]["@id"]
+                license_url = canvas["images"][0].get("license")
+                attribution = canvas["images"][0].get("attribution")
+                if not is_accessible_license(license_url):
+                    continue
+                uris.append(image)
+                licenses.append(license_url)
+                attributions.append(attribution)
+            except Exception:
+                continue
+        # IIIF v3 fallback
+        if not uris:
+            for canvas in manifest.get("items", []):
+                try:
+                    body = canvas.get("items", [{}])[0].get("items", [{}])[0].get("body", {})
+                    image = body.get("id") or body.get("@id")
+                    license_url = body.get("license")
+                    if not image or not is_accessible_license(license_url):
+                        continue
+                    uris.append(image)
+                    licenses.append(license_url)
+                    attributions.append(canvas.get("requiredStatement"))
+                except Exception:
+                    continue
+
+        if not uris:
+            return {
+                "objectNumber": on,
+                "outcome": "manifest_failed",
+                "before": before,
+                "reason": "no_images_in_manifest",
+            }
+
+        # HEAD-check the recovered URIs.
+        statuses = [None] * len(uris)
+        with ThreadPoolExecutor(max_workers=min(4, len(uris))) as pool:
+            fut_to_idx = {
+                pool.submit(_check_iiif_image_accessible, u, head_session): i
+                for i, u in enumerate(uris)
+            }
+            for fut in as_completed(fut_to_idx):
+                i = fut_to_idx[fut]
+                try:
+                    statuses[i] = fut.result()
+                except Exception as e:
+                    statuses[i] = (False, None, f"crash:{e}")
+
+        kept_uris, kept_lic, kept_attr, per = [], [], [], []
+        for i, uri in enumerate(uris):
+            ok, code, reason = statuses[i]
+            per.append({"uri": uri, "ok": ok, "code": code, "reason": reason})
+            if ok:
+                kept_uris.append(uri)
+                kept_lic.append(licenses[i])
+                kept_attr.append(attributions[i])
+
+        return {
+            "objectNumber": on,
+            "outcome": "checked",
+            "before": before,
+            "original_count": len(uris),
+            "kept_count": len(kept_uris),
+            "per_image": per,
+            "kept_uris": kept_uris,
+            "kept_licenses": kept_lic,
+            "kept_attributions": kept_attr,
+        }
+
+    def _handle(res):
+        on = res["objectNumber"]
+        before = res["before"]
+        with lock:
+            _bump(counters["before_status"], before)
+            counters["processed"] += 1
+
+        if res["outcome"] == "manifest_failed":
+            with lock:
+                counters["manifest_failed"] += 1
+            logging.info(f"[{on}] manifest fetch/parse failed: {res['reason']}")
+            return
+
+        kept = res["kept_count"]
+        original = res["original_count"]
+        with lock:
+            for entry in res["per_image"]:
+                _bump(counters["by_reason"], entry["reason"])
+
+        # Build payload, exactly mirroring validate_iiif_images conventions.
+        if kept == 0:
+            reasons = {e["reason"] for e in res["per_image"]}
+            if "forbidden" in reasons:
+                status_str = "PERMISSION DENIED"
+            elif "timeout" in reasons:
+                status_str = "TIMEOUT"
+            elif "ssl_error" in reasons:
+                status_str = "SSL_ERROR"
+            else:
+                status_str = "FAILED"
+            payload = {
+                "iiif_image_uris": [],
+                "CC_Licenses": status_str,
+                "attributions": [],
+            }
+            with lock:
+                counters["still_failing"] += 1
+                _bump(counters["after_status"], status_str)
+            logging.info(f"[{on}] {before} → {status_str} (still no working images)")
+        else:
+            payload = {
+                "iiif_image_uris": res["kept_uris"],
+                "CC_Licenses": res["kept_licenses"],
+                "attributions": res["kept_attributions"],
+            }
+            with lock:
+                if kept == original:
+                    counters["recovered_full"] += 1
+                    _bump(counters["after_status"], "RECOVERED_FULL")
+                else:
+                    counters["recovered_partial"] += 1
+                    _bump(counters["after_status"], "RECOVERED_PARTIAL")
+            logging.info(f"[{on}] {before} → recovered {kept}/{original} images")
+
+        try:
+            if dry_run:
+                with lock:
+                    counters["updates"] += 1
+            else:
+                supabase.table("dmg_objects_LDES").update(payload).eq(
+                    "objectNumber", on
+                ).execute()
+                with lock:
+                    counters["updates"] += 1
+        except Exception as e:
+            logging.error(f"[{on}] DB update failed: {e}")
+            with lock:
+                counters["errors"] += 1
+
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        futures = [pool.submit(_retry_one, row) for row in candidates]
+        for fut in tqdm(as_completed(futures), total=len(futures),
+                        desc="Retrying transient failures", unit="obj"):
+            try:
+                _handle(fut.result())
+            except Exception as e:
+                logging.error(f"Retry worker crashed: {e}")
+                with lock:
+                    counters["errors"] += 1
+                    counters["processed"] += 1
+
+    # 3) Final analysis — focused on the retry-specific signal.
+    total_after = counters["recovered_full"] + counters["recovered_partial"] + counters["still_failing"]
+
+    def _pct(n, d):
+        return f"{(100.0 * n / d):.1f}%" if d else "—"
+
+    logging.info("=" * 60)
+    logging.info("      revalidate_transient_failures — FINAL ANALYSIS")
+    logging.info("=" * 60)
+    logging.info(f"  Mode:                  {'DRY RUN' if dry_run else 'LIVE'}")
+    logging.info(f"  Retry pool:            {list(include_statuses)}")
+    logging.info("")
+    logging.info(f"  Candidates:            {len(candidates)}")
+    logging.info(f"  Processed:             {counters['processed']}")
+    logging.info(f"  Manifest fetch failed: {counters['manifest_failed']}")
+    logging.info(f"  DB writes:             {counters['updates']}{' (dry-run)' if dry_run else ''}")
+    logging.info(f"  Worker errors:         {counters['errors']}")
+    logging.info("")
+    logging.info("  --- Outcomes ---")
+    logging.info(f"  Fully recovered:       {counters['recovered_full']}  ({_pct(counters['recovered_full'], total_after)})")
+    logging.info(f"  Partially recovered:   {counters['recovered_partial']}  ({_pct(counters['recovered_partial'], total_after)})")
+    logging.info(f"  Still failing:         {counters['still_failing']}  ({_pct(counters['still_failing'], total_after)})")
+    logging.info("")
+    logging.info("  --- Before → after status flow ---")
+    logging.info(f"    before:")
+    for s in sorted(counters["before_status"].keys()):
+        logging.info(f"      {s}: {counters['before_status'][s]}")
+    logging.info(f"    after:")
+    for s in sorted(counters["after_status"].keys()):
+        logging.info(f"      {s}: {counters['after_status'][s]}")
+    logging.info("")
+    logging.info("  --- Per-image reasons (this run) ---")
+    for r in sorted(counters["by_reason"].keys()):
+        logging.info(f"    {r}: {counters['by_reason'][r]}")
+    logging.info("=" * 60)
+
+
 def iiif_downscale_url(uri: str, width: int = 300) -> str:
     return uri.replace(
         "/full/full/0/default.jpg",
@@ -532,13 +1263,17 @@ def iiif_downscale_url(uri: str, width: int = 300) -> str:
 def safe_url(url: str) -> str:
     return quote(url, safe=":/,?=&%!")
 
+import certifi
+import requests
+
 
 def read_image_from_url(url: str, timeout: int = 15) -> np.ndarray:
     encoded_url = safe_url(url)
     resp = requests.get(
         encoded_url,
         timeout=timeout,
-        headers={"User-Agent": "Mozilla/5.0"}
+        headers={"User-Agent": "Mozilla/5.0"},
+        verify=certifi.where()
     )
     resp.raise_for_status()
     image = Image.open(BytesIO(resp.content)).convert("RGB")
